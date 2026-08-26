@@ -10,14 +10,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
-import gradio as gr
-import torch
-import yaml
-from diffusers import DiffusionPipeline
-from fastapi import HTTPException
-from huggingface_hub import HfApi
-from pydantic import BaseModel, Field
-
+# ZeroGPU must be imported before any package that may initialize CUDA.
 try:
     import spaces
 except ImportError:  # Allows local development outside Hugging Face Spaces.
@@ -26,6 +19,14 @@ except ImportError:  # Allows local development outside Hugging Face Spaces.
         def GPU(*_args, **_kwargs):
             return lambda function: function
     spaces = _SpacesFallback()
+
+import gradio as gr
+import torch
+import yaml
+from diffusers import DiffusionPipeline
+from fastapi import HTTPException
+from huggingface_hub import HfApi
+from pydantic import BaseModel, Field
 
 BASE_MODEL = "Qwen/Qwen-Image-2512"
 OWNER = os.getenv("HF_SPACE_OWNER", "jjmcarrascosa")
