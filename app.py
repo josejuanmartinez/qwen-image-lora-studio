@@ -18,6 +18,15 @@ from fastapi import HTTPException
 from huggingface_hub import HfApi
 from pydantic import BaseModel, Field
 
+try:
+    import spaces
+except ImportError:  # Allows local development outside Hugging Face Spaces.
+    class _SpacesFallback:
+        @staticmethod
+        def GPU(*_args, **_kwargs):
+            return lambda function: function
+    spaces = _SpacesFallback()
+
 BASE_MODEL = "Qwen/Qwen-Image-2512"
 OWNER = os.getenv("HF_SPACE_OWNER", "jjmcarrascosa")
 ROOT = Path(os.getenv("SPACE_WORKDIR", "/tmp/qwen-image-lora-studio"))
@@ -167,6 +176,7 @@ def generate(request: GenerateRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@spaces.GPU(duration=120)
 def generate_ui(prompt, lora_name, negative_prompt, width, height, steps, guidance, scale, seed):
     result = generate(GenerateRequest(prompt=prompt, lora_name=lora_name or None, negative_prompt=negative_prompt, width=int(width), height=int(height), steps=int(steps), guidance_scale=float(guidance), lora_scale=float(scale), seed=int(seed) if seed else None))
     from PIL import Image
