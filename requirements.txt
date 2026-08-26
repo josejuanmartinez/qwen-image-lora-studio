@@ -1,0 +1,12 @@
+git+https://github.com/huggingface/diffusers.git
+accelerate>=1.4.0
+bitsandbytes>=0.45.0
+fastapi>=0.115.0
+gradio>=5.49.1
+huggingface_hub>=0.30.0
+peft>=0.14.0
+pillow>=10.0.0
+pyyaml>=6.0.0
+safetensors>=0.5.0
+sentencepiece>=0.2.0
+transformers>=4.51.0
