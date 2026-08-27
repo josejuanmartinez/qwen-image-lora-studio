@@ -27,7 +27,7 @@ network:
 ```
 
 The Space intentionally uses Python 3.11 because AI Toolkit currently pins SciPy 1.12, which does not provide Python 3.13 wheels.
-AI Toolkit is installed in an isolated virtual environment so its pinned dependencies cannot modify the running Gradio application. The Train tab streams installation and trainer output into a large live console and prevents another training submission while a job is active.
+AI Toolkit is installed in an isolated virtual environment so its pinned dependencies cannot modify the running Gradio application. The Train tab streams installation and trainer output into a fixed, scrollable live console and prevents another training submission while a job is active. Job status and bounded logs are also saved under `/tmp/qwen-image-lora-studio/jobs/<job-name>/`, so refreshing Gradio automatically reopens the latest job and continues displaying its log.
 The toolkit environment also pins `kernels==0.12.3`, matching the API required by its Transformers 5.5.x dependency. For PyTorch 2.11 and newer it installs TorchAudio 2.11, which uses PyTorch's stable ABI; older PyTorch releases receive their matching TorchAudio build.
 
 ## Space secrets
@@ -48,11 +48,13 @@ Set `HF_TOKEN` in **Settings → Variables and secrets**. It must have write acc
   "steps": 28,
   "guidance_scale": 4.0,
   "lora_scale": 0.8,
-  "seed": 42
+  "seed": 42,
+  "remove_background": true,
+  "upscale_to_2k": true
 }
 ```
 
-The response contains a PNG as base64 plus the used seed. LoRA names resolve to `jjmcarrascosa/<lora_name>`; fully-qualified private model IDs also work.
+The response contains a PNG as base64 plus its dimensions, transparency status, upscaler details, and used seed. When `upscale_to_2k` is enabled, the app uses the `caidas/swin2SR-lightweight-x2-64` neural super-resolution model, preserves any alpha channel separately, and enlarges the longest edge to 2048 pixels without downscaling larger images. If Swin2SR cannot load or fit in memory, the response reports that it used the Lanczos fallback. LoRA names resolve to `jjmcarrascosa/<lora_name>`; fully-qualified private model IDs also work.
 
 ## Hardware
 

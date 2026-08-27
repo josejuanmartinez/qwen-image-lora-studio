@@ -1,5 +1,6 @@
 import base64
 import copy
+import json
 import os
 import re
 import subprocess
@@ -29,12 +30,14 @@ from huggingface_hub import HfApi
 from pydantic import BaseModel, Field
 
 BASE_MODEL = "Qwen/Qwen-Image-2512"
+SWIN2SR_MODEL = "caidas/swin2SR-lightweight-x2-64"
 OWNER = os.getenv("HF_SPACE_OWNER", "jjmcarrascosa")
 ROOT = Path(os.getenv("SPACE_WORKDIR", "/tmp/qwen-image-lora-studio"))
 TOOLKIT = ROOT / "ai-toolkit"
 TOOLKIT_VENV = ROOT / ".ai-toolkit-venv"
 JOBS = ROOT / "jobs"
 JOBS.mkdir(parents=True, exist_ok=True)
+LATEST_JOB_FILE = JOBS / "latest-job.txt"
 TOOLKIT_INSTALL_MARKER = TOOLKIT_VENV / ".studio-dependencies-installed-v4"
 TOOLKIT_COMPAT_PACKAGES = ["kernels==0.12.3"]
 GALLERY_PAGE_SIZE = 12
@@ -45,6 +48,17 @@ APP_CSS = """
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
     overflow-y: auto !important;
     resize: none !important;
+}
+.transparent-result .image-container,
+.transparent-result .wrap {
+    background-color: #f4f4f4 !important;
+    background-image:
+        linear-gradient(45deg, #d8d8d8 25%, transparent 25%),
+        linear-gradient(-45deg, #d8d8d8 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #d8d8d8 75%),
+        linear-gradient(-45deg, transparent 75%, #d8d8d8 75%) !important;
+    background-position: 0 0, 0 10px, 10px -10px, -10px 0 !important;
+    background-size: 20px 20px !important;
 }
 """
 TRAINING_PARAM_NAMES = (
@@ -61,7 +75,10 @@ TRAINING_PARAM_NAMES = (
 
 pipe = None
 loaded_lora = None
+swin2sr_processor = None
+swin2sr_model = None
 pipe_lock = threading.Lock()
+swin2sr_lock = threading.Lock()
 toolkit_lock = threading.Lock()
 jobs_lock = threading.RLock()
 jobs: dict[str, dict] = {}
@@ -85,6 +102,61 @@ def lora_repo(name: str) -> str:
     return name if "/" in name else f"{OWNER}/{slug(name)}"
 
 
+def job_log_path(run_name: str) -> Path:
+    return JOBS / slug(run_name) / "training.log"
+
+
+def job_metadata_path(run_name: str) -> Path:
+    return JOBS / slug(run_name) / "job.json"
+
+
+def persist_job_metadata(run_name: str) -> None:
+    job = jobs.get(run_name)
+    if job is None:
+        return
+    path = job_metadata_path(run_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {key: value for key, value in job.items() if key != "log"}
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def load_job_metadata(run_name: str) -> Optional[dict]:
+    run_name = slug(run_name)
+    with jobs_lock:
+        if run_name in jobs:
+            return jobs[run_name]
+        path = job_metadata_path(run_name)
+        if not path.exists():
+            return None
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(job, dict):
+            return None
+        jobs[run_name] = job
+        return job
+
+
+def latest_job_name() -> str:
+    try:
+        candidate = slug(LATEST_JOB_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return candidate if job_metadata_path(candidate).exists() else ""
+
+
+def read_job_log(run_name: str) -> str:
+    try:
+        content = job_log_path(run_name).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        with jobs_lock:
+            content = jobs.get(run_name, {}).get("log", "")
+    return content[-MAX_JOB_LOG_CHARS:] or "No log output yet."
+
+
 def append_job_log(run_name: str, message: str) -> None:
     with jobs_lock:
         job = jobs.get(run_name)
@@ -92,12 +164,19 @@ def append_job_log(run_name: str, message: str) -> None:
             return
         job["log"] = (job.get("log", "") + message)[-MAX_JOB_LOG_CHARS:]
         job["updated_at"] = time.time()
+        path = job_log_path(run_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(message)
+        if path.stat().st_size > MAX_JOB_LOG_CHARS * 2:
+            path.write_text(read_job_log(run_name), encoding="utf-8")
 
 
 def set_job_status(run_name: str, status_value: str, message: Optional[str] = None) -> None:
     with jobs_lock:
         jobs[run_name]["status"] = status_value
         jobs[run_name]["updated_at"] = time.time()
+        persist_job_metadata(run_name)
     if message:
         append_job_log(run_name, f"\n[{time.strftime('%H:%M:%S')}] {message}\n")
 
@@ -380,6 +459,7 @@ def run_training(run_name: str, image_dir: Path, config: dict) -> None:
         api.upload_file(path_or_fileobj=str(config_file), path_in_repo="training_config.yaml", repo_id=repo_id, repo_type="model", commit_message="Add training configuration")
         with jobs_lock:
             jobs[run_name]["repo_id"] = repo_id
+            persist_job_metadata(run_name)
         set_job_status(run_name, "published", f"Published privately to {repo_id}")
     except Exception as exc:
         set_job_status(run_name, "failed", f"ERROR: {str(exc)[-12000:]}")
@@ -412,6 +492,10 @@ def start_training(files, lora_name: str, trigger_word: str, caption: str, *para
             "log": f"[{time.strftime('%H:%M:%S')}] Preparing uploaded images…\n",
             "updated_at": time.time(),
         }
+        job_log_path(run_name).parent.mkdir(parents=True, exist_ok=True)
+        job_log_path(run_name).write_text(jobs[run_name]["log"], encoding="utf-8")
+        persist_job_metadata(run_name)
+        LATEST_JOB_FILE.write_text(run_name, encoding="utf-8")
     image_dir.mkdir(parents=True, exist_ok=True)
     from PIL import Image, ImageOps
     image_caption = caption.strip() or trigger_word
@@ -432,7 +516,7 @@ def start_training(files, lora_name: str, trigger_word: str, caption: str, *para
     return (
         f"### ⏳ Queued `{run_name}`\nIt will publish privately to `{lora_repo(run_name)}` when complete.",
         run_name,
-        jobs[run_name]["log"],
+        read_job_log(run_name),
         gr.update(interactive=False, value="Training in progress…"),
     )
 
@@ -481,19 +565,20 @@ def training_button_state(lora_name: str, trigger_word: str, files):
 
 
 def job_view(lora_name: str, form_name: str = "", trigger_word: str = "", files=None):
+    try:
+        run_name = slug(lora_name) if lora_name else latest_job_name()
+        loaded = load_job_metadata(run_name) if run_name else None
+        job = copy.deepcopy(loaded) if loaded else None
+    except ValueError:
+        run_name, job = "", None
     button = training_button_state(form_name, trigger_word, files)
-    with jobs_lock:
-        try:
-            job = copy.deepcopy(jobs.get(slug(lora_name))) if lora_name else None
-        except ValueError:
-            job = None
     if job is None:
-        return "### No local job found", "Enter a job name or start training to view its live log.", button
+        return "### No local job found", "Enter a job name or start training to view its live log.", button, ""
     status_value = job.get("status", "unknown")
     icon = "✅" if status_value == "published" else "❌" if status_value == "failed" else "⏳"
     repo_id = job.get("repo_id", "")
-    summary = f"### {icon} `{lora_name}` — {status_value}\nPrivate destination: `{repo_id}`"
-    return summary, job.get("log", "No log output yet."), button
+    summary = f"### {icon} `{run_name}` — {status_value}\nPrivate destination: `{repo_id}`"
+    return summary, read_job_log(run_name), button, run_name
 
 
 def get_pipe(lora_name: Optional[str], scale: float):
@@ -527,6 +612,113 @@ class GenerateRequest(BaseModel):
     lora_scale: float = Field(default=0.8, ge=0, le=2)
     seed: Optional[int] = None
     remove_background: bool = True
+    upscale_to_2k: bool = False
+
+
+def target_2k_size(image):
+    target_long_edge = 2048
+    current_long_edge = max(image.size)
+    if current_long_edge >= target_long_edge:
+        return image.size
+    scale = target_long_edge / current_long_edge
+    return (
+        max(1, round(image.width * scale)),
+        max(1, round(image.height * scale)),
+    )
+
+
+def lanczos_upscale_to_2k(image):
+    from PIL import Image
+    return image.resize(target_2k_size(image), Image.Resampling.LANCZOS)
+
+
+def get_swin2sr():
+    global swin2sr_processor, swin2sr_model
+    with swin2sr_lock:
+        if swin2sr_model is None:
+            from transformers import AutoImageProcessor, Swin2SRForImageSuperResolution
+            processor = AutoImageProcessor.from_pretrained(SWIN2SR_MODEL)
+            model = Swin2SRForImageSuperResolution.from_pretrained(SWIN2SR_MODEL)
+            model.eval().to("cuda")
+            swin2sr_processor = processor
+            swin2sr_model = model
+        return swin2sr_processor, swin2sr_model
+
+
+def run_swin2sr_tiled(image, tile_size=512, overlap=32):
+    """Run learned x2 super-resolution in contextual tiles to control VRAM use."""
+    from PIL import Image
+
+    processor, model = get_swin2sr()
+    output = Image.new("RGB", (image.width * 2, image.height * 2))
+    core_size = tile_size - (overlap * 2)
+    for top in range(0, image.height, core_size):
+        for left in range(0, image.width, core_size):
+            core_right = min(left + core_size, image.width)
+            core_bottom = min(top + core_size, image.height)
+            tile_left = max(0, left - overlap)
+            tile_top = max(0, top - overlap)
+            tile_right = min(image.width, core_right + overlap)
+            tile_bottom = min(image.height, core_bottom + overlap)
+            tile = image.crop((tile_left, tile_top, tile_right, tile_bottom))
+
+            inputs = processor(images=tile, return_tensors="pt")
+            inputs = {name: value.to("cuda") for name, value in inputs.items()}
+            with torch.inference_mode():
+                reconstruction = model(**inputs).reconstruction
+            pixels = (
+                reconstruction[0]
+                .detach()
+                .float()
+                .clamp_(0, 1)
+                .mul_(255)
+                .round_()
+                .byte()
+                .permute(1, 2, 0)
+                .cpu()
+                .numpy()
+            )
+            enhanced_tile = Image.fromarray(pixels, mode="RGB")
+            expected_tile_size = (tile.width * 2, tile.height * 2)
+            if enhanced_tile.size != expected_tile_size:
+                enhanced_tile = enhanced_tile.resize(expected_tile_size, Image.Resampling.LANCZOS)
+
+            crop_box = (
+                (left - tile_left) * 2,
+                (top - tile_top) * 2,
+                (core_right - tile_left) * 2,
+                (core_bottom - tile_top) * 2,
+            )
+            output.paste(enhanced_tile.crop(crop_box), (left * 2, top * 2))
+    return output
+
+
+def upscale_image_to_2k(image):
+    """Use Swin2SR for RGB detail and preserve any transparency independently."""
+    from PIL import Image
+
+    final_size = target_2k_size(image)
+    if final_size == image.size:
+        return image, "unchanged (already 2K)"
+
+    # The checkpoint is a native x2 model. Normalize its input to half of the
+    # desired dimensions, then make the final one-pixel adjustment if needed.
+    model_input_size = (
+        max(1, (final_size[0] + 1) // 2),
+        max(1, (final_size[1] + 1) // 2),
+    )
+    rgb = image.convert("RGB")
+    if rgb.size != model_input_size:
+        rgb = rgb.resize(model_input_size, Image.Resampling.LANCZOS)
+    enhanced = run_swin2sr_tiled(rgb)
+    if enhanced.size != final_size:
+        enhanced = enhanced.resize(final_size, Image.Resampling.LANCZOS)
+
+    if "A" in image.getbands():
+        alpha = image.getchannel("A").resize(final_size, Image.Resampling.LANCZOS)
+        enhanced = enhanced.convert("RGBA")
+        enhanced.putalpha(alpha)
+    return enhanced, f"Swin2SR x2 ({SWIN2SR_MODEL})"
 
 
 def generate(request: GenerateRequest):
@@ -539,18 +731,58 @@ def generate(request: GenerateRequest):
             # The rembg model downloads once on first request and remains cached by the Space.
             from rembg import remove
             image = remove(image).convert("RGBA")
+        upscaler = None
+        upscale_warning = None
+        if request.upscale_to_2k:
+            try:
+                image, upscaler = upscale_image_to_2k(image)
+            except Exception as upscale_error:
+                # Generation should remain usable if the optional model cannot
+                # download, initialize, or fit in the currently available VRAM.
+                upscale_warning = f"Swin2SR unavailable; used Lanczos fallback: {upscale_error}"
+                print(upscale_warning, flush=True)
+                image = lanczos_upscale_to_2k(image)
+                upscaler = "Lanczos fallback"
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        has_transparency = image.mode == "RGBA" and image.getextrema()[3][0] < 255
         buffer = BytesIO()
         image.save(buffer, format="PNG")
-        return {"seed": seed, "image_base64": base64.b64encode(buffer.getvalue()).decode("ascii"), "mime_type": "image/png"}
+        return {
+            "seed": seed,
+            "width": image.width,
+            "height": image.height,
+            "transparent": has_transparency,
+            "upscaler": upscaler,
+            "upscale_warning": upscale_warning,
+            "image_base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
+            "mime_type": "image/png",
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @spaces.GPU(duration=120)
-def generate_ui(prompt, lora_name, negative_prompt, width, height, steps, guidance, scale, seed):
-    result = generate(GenerateRequest(prompt=prompt, lora_name=lora_name or None, negative_prompt=negative_prompt, width=int(width), height=int(height), steps=int(steps), guidance_scale=float(guidance), lora_scale=float(scale), seed=int(seed) if seed else None, remove_background=True))
+def generate_ui(prompt, lora_name, negative_prompt, width, height, steps, guidance, scale, seed, remove_background, upscale_to_2k):
+    result = generate(GenerateRequest(
+        prompt=prompt,
+        lora_name=lora_name or None,
+        negative_prompt=negative_prompt,
+        width=int(width),
+        height=int(height),
+        steps=int(steps),
+        guidance_scale=float(guidance),
+        lora_scale=float(scale),
+        seed=int(seed) if seed is not None else None,
+        remove_background=bool(remove_background),
+        upscale_to_2k=bool(upscale_to_2k),
+    ))
     from PIL import Image
-    return Image.open(BytesIO(base64.b64decode(result["image_base64"]))), result["seed"]
+    transparency = "transparent PNG" if result["transparent"] else "opaque PNG"
+    upscaler = f" · {result['upscaler']}" if result["upscaler"] else ""
+    warning = f"\n\n⚠️ {result['upscale_warning']}" if result["upscale_warning"] else ""
+    details = f"**{result['width']} × {result['height']}** · {transparency} · seed `{result['seed']}`{upscaler}{warning}"
+    return Image.open(BytesIO(base64.b64decode(result["image_base64"]))), result["seed"], details
 
 
 with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
@@ -869,7 +1101,7 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
         check_status.click(
             job_view,
             [check_name, name, trigger, image_files],
-            [training_status, training_log, train],
+            [training_status, training_log, train, active_job],
         )
         required_inputs = [name, trigger, image_files]
         name.input(
@@ -894,7 +1126,13 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
         training_timer.tick(
             job_view,
             [active_job, name, trigger, image_files],
-            [training_status, training_log, train],
+            [training_status, training_log, train, active_job],
+            show_progress="hidden",
+        )
+        demo.load(
+            job_view,
+            [active_job, name, trigger, image_files],
+            [training_status, training_log, train, active_job],
             show_progress="hidden",
         )
     with gr.Tab("Generate"):
@@ -936,10 +1174,37 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
                 label="Seed (empty = random)", precision=0,
                 info="Random seed for reproducible output; leave empty to choose one automatically.",
             )
+        with gr.Row():
+            remove_background = gr.Checkbox(
+                value=True,
+                label="Remove background (transparent PNG)",
+                info="Segments the generated subject and stores genuine PNG alpha transparency.",
+            )
+            upscale_to_2k = gr.Checkbox(
+                value=False,
+                label="AI upscale output to 2K (Swin2SR)",
+                info="Uses tiled Swin2SR neural super-resolution and preserves transparency. The longest edge becomes 2048 pixels; existing 2K images are unchanged.",
+            )
         run = gr.Button("Generate", variant="primary")
-        image = gr.Image(label="Result")
-        used_seed = gr.Number(label="Used seed", precision=0)
-        run.click(generate_ui, [prompt, lora, negative, width, height, infer_steps, guidance, scale, seed], [image, used_seed])
+        image = gr.Image(
+            label="PNG result",
+            format="png",
+            elem_classes="transparent-result",
+        )
+        output_details = gr.Markdown()
+        used_seed = gr.Number(
+            label="Used seed",
+            precision=0,
+            info="Seed used for this image; reuse it to reproduce or refine the result.",
+        )
+        run.click(
+            generate_ui,
+            [
+                prompt, lora, negative, width, height, infer_steps, guidance,
+                scale, seed, remove_background, upscale_to_2k,
+            ],
+            [image, used_seed, output_details],
+        )
 
 demo.app.add_api_route("/v1/generate", generate, methods=["POST"], response_model=None)
 
