@@ -35,11 +35,18 @@ TOOLKIT = ROOT / "ai-toolkit"
 TOOLKIT_VENV = ROOT / ".ai-toolkit-venv"
 JOBS = ROOT / "jobs"
 JOBS.mkdir(parents=True, exist_ok=True)
-TOOLKIT_INSTALL_MARKER = TOOLKIT_VENV / ".studio-dependencies-installed-v2"
+TOOLKIT_INSTALL_MARKER = TOOLKIT_VENV / ".studio-dependencies-installed-v3"
 TOOLKIT_COMPAT_PACKAGES = ["kernels==0.12.3"]
 GALLERY_PAGE_SIZE = 12
 MAX_JOB_LOG_CHARS = 100_000
 ACTIVE_JOB_STATUSES = {"preparing images", "queued", "installing AI Toolkit", "training", "publishing"}
+APP_CSS = """
+.training-log-console textarea {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+    overflow-y: auto !important;
+    resize: none !important;
+}
+"""
 TRAINING_PARAM_NAMES = (
     "steps", "rank", "alpha", "network_dropout", "learning_rate", "optimizer",
     "lr_scheduler", "batch_size", "gradient_accumulation", "max_grad_norm",
@@ -125,6 +132,21 @@ def toolkit_python() -> Path:
     return TOOLKIT_VENV / scripts_dir / executable
 
 
+def toolkit_torch_version() -> str:
+    output = run_checked(
+        [
+            str(toolkit_python()),
+            "-c",
+            "import torch; print(torch.__version__.split('+', 1)[0])",
+        ],
+        cwd=TOOLKIT,
+    )
+    version = output.strip().splitlines()[-1]
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[a-z]+\d+)?", version):
+        raise RuntimeError(f"Could not determine a compatible torchaudio version from PyTorch {version!r}.")
+    return version
+
+
 def ensure_toolkit(run_name: Optional[str] = None) -> None:
     emit = (lambda line: append_job_log(run_name, line)) if run_name else None
     with toolkit_lock:
@@ -154,10 +176,26 @@ def ensure_toolkit(run_name: Optional[str] = None) -> None:
                 cwd=TOOLKIT,
                 on_output=emit,
             )
+            torch_version = toolkit_torch_version()
+            if emit:
+                emit(f"Installing torchaudio {torch_version} to match PyTorch {torch_version}\n")
+            run_checked(
+                [
+                    str(toolkit_python()),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-deps",
+                    f"torchaudio=={torch_version}",
+                ],
+                cwd=TOOLKIT,
+                on_output=emit,
+            )
             run_checked(
                 [
                     str(toolkit_python()),
                     "-c",
+                    "import torchaudio; "
                     "from transformers import T5Tokenizer, T5EncoderModel, UMT5EncoderModel; "
                     "print('AI Toolkit dependency check passed')",
                 ],
@@ -789,15 +827,15 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
         active_job = gr.State("")
         train = gr.Button("Enter a job name to train", variant="primary", interactive=False)
         training_status = gr.Markdown("### Ready to train")
-        training_log = gr.Code(
+        training_log = gr.Textbox(
             value="Training output will appear here live.",
-            language="shell",
-            lines=28,
-            max_lines=40,
+            lines=50,
+            max_lines=50,
             label="Live training log",
+            info="Fixed-height console. It follows new output automatically; scroll up to pause auto-scrolling and inspect earlier lines.",
             interactive=False,
-            show_line_numbers=False,
-            wrap_lines=True,
+            autoscroll=True,
+            elem_classes="training-log-console",
         )
         training_controls = [
             steps, rank, alpha, network_dropout, learning_rate, optimizer, lr_scheduler,
@@ -892,4 +930,4 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
 demo.app.add_api_route("/v1/generate", generate, methods=["POST"], response_model=None)
 
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=1).launch(server_name="0.0.0.0", ssr_mode=False)
+    demo.queue(default_concurrency_limit=1).launch(server_name="0.0.0.0", ssr_mode=False, css=APP_CSS)
