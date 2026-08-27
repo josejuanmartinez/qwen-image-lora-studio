@@ -272,9 +272,9 @@ def qwen_config(run_name: str, image_dir: Path, trigger_word: str, options: dict
             "sample_start_step": 0,
             "width": int(options["sample_width"]),
             "height": int(options["sample_height"]),
-            "prompts": [options["sample_prompt"].strip() or f"{trigger_word}, portrait photo, detailed"],
-            "neg": options["sample_negative"],
-            "seed": int(options["sample_seed"]),
+            "prompts": [(options.get("sample_prompt") or "").strip() or f"{trigger_word}, portrait photo, detailed"],
+            "neg": options.get("sample_negative") or "",
+            "seed": int(options.get("sample_seed") if options.get("sample_seed") is not None else 42),
             "walk_seed": bool(options["walk_seed"]),
             "guidance_scale": float(options["sample_guidance"]),
             "sample_steps": int(options["sample_steps"]),
@@ -334,15 +334,20 @@ def run_training(run_name: str, image_dir: Path, config: dict) -> None:
 
 
 def start_training(files, lora_name: str, trigger_word: str, caption: str, *param_values):
+    lora_name = (lora_name or "").strip()
+    trigger_word = (trigger_word or "").strip()
+    caption = caption or ""
     if not files:
         raise gr.Error("Upload one or more training images.")
-    if not trigger_word.strip():
+    if not lora_name:
+        raise gr.Error("Enter a required job / private LoRA name before training.")
+    if not trigger_word:
         raise gr.Error("Provide a trigger word, such as mysubject.")
     try:
         run_name = slug(lora_name)
         options = dict(zip(TRAINING_PARAM_NAMES, param_values, strict=True))
         image_dir = JOBS / run_name / f"images-{time.time_ns()}"
-        config = qwen_config(run_name, image_dir, trigger_word.strip(), options)
+        config = qwen_config(run_name, image_dir, trigger_word, options)
     except (TypeError, ValueError, yaml.YAMLError) as exc:
         raise gr.Error(str(exc)) from exc
     with jobs_lock:
@@ -357,9 +362,9 @@ def start_training(files, lora_name: str, trigger_word: str, caption: str, *para
         }
     image_dir.mkdir(parents=True, exist_ok=True)
     from PIL import Image, ImageOps
-    image_caption = caption.strip() or trigger_word.strip()
-    if trigger_word.strip().lower() not in image_caption.lower():
-        image_caption = f"{trigger_word.strip()}, {image_caption}"
+    image_caption = caption.strip() or trigger_word
+    if trigger_word.lower() not in image_caption.lower():
+        image_caption = f"{trigger_word}, {image_caption}"
     for index, path in enumerate(files):
         source = Path(path[0] if isinstance(path, (tuple, list)) else path)
         target = image_dir / f"{index:04d}.png"
@@ -409,17 +414,27 @@ def clear_gallery():
     return [], items, page, summary, previous, following
 
 
-def job_view(lora_name: str):
+def training_button_state(lora_name: str, trigger_word: str, files):
     with jobs_lock:
         any_active = any(job.get("status") in ACTIVE_JOB_STATUSES for job in jobs.values())
+    if any_active:
+        return gr.update(interactive=False, value="Training in progress…")
+    if not (lora_name or "").strip():
+        return gr.update(interactive=False, value="Enter a job name to train")
+    if not (trigger_word or "").strip():
+        return gr.update(interactive=False, value="Enter a trigger word to train")
+    if not files:
+        return gr.update(interactive=False, value="Add training images to continue")
+    return gr.update(interactive=True, value="Train and publish private LoRA")
+
+
+def job_view(lora_name: str, form_name: str = "", trigger_word: str = "", files=None):
+    button = training_button_state(form_name, trigger_word, files)
+    with jobs_lock:
         try:
             job = copy.deepcopy(jobs.get(slug(lora_name))) if lora_name else None
         except ValueError:
             job = None
-    button = gr.update(
-        interactive=not any_active,
-        value="Training in progress…" if any_active else "Train and publish private LoRA",
-    )
     if job is None:
         return "### No local job found", "Enter a job name or start training to view its live log.", button
     status_value = job.get("status", "unknown")
@@ -539,91 +554,217 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
         clear_images.click(clear_gallery, outputs=[image_files, *gallery_outputs])
 
         with gr.Row():
-            name = gr.Textbox(label="Private LoRA name", placeholder="mysubject-v1")
-            trigger = gr.Textbox(label="Trigger word", placeholder="mysubject")
-        caption = gr.Textbox(label="Default caption", placeholder="photo of mysubject")
-        steps = gr.Slider(500, 4000, value=1500, step=100, label="Training steps")
+            name = gr.Textbox(
+                label="Job / private LoRA name (required)",
+                placeholder="mysubject-v1",
+                info="Required before training. This also becomes the private model repository name.",
+            )
+            trigger = gr.Textbox(
+                label="Trigger word",
+                placeholder="mysubject",
+                info="Unique word used in captions and prompts to activate this LoRA.",
+            )
+        with gr.Row():
+            caption = gr.Textbox(
+                label="Common style caption",
+                placeholder="photo of mysubject",
+                info="Shared description saved with every training image. The trigger word is added automatically if missing.",
+            )
+            sample_prompt = gr.Textbox(
+                label="Verification image prompt",
+                placeholder="mysubject, portrait photo, detailed",
+                info="Prompt used only to create progress images during training; it does not label the dataset.",
+            )
+        steps = gr.Slider(
+            500, 4000, value=1500, step=100, label="Training steps",
+            info="Total optimizer updates. More steps can learn more detail but may overfit.",
+        )
 
         with gr.Accordion("LoRA network", open=False):
             gr.Markdown("Defaults follow the Qwen Image 24 GB AI Toolkit recipe.")
             with gr.Row():
-                rank = gr.Slider(1, 256, value=16, step=1, label="Rank / linear dimension")
-                alpha = gr.Slider(0.1, 256, value=16, step=0.1, label="Linear alpha")
-                network_dropout = gr.Slider(0, 1, value=0, step=0.01, label="Network dropout")
+                rank = gr.Slider(
+                    1, 256, value=16, step=1, label="Rank / linear dimension",
+                    info="LoRA capacity. Higher ranks can capture more detail but use more VRAM and produce larger files.",
+                )
+                alpha = gr.Slider(
+                    0.1, 256, value=16, step=0.1, label="Linear alpha",
+                    info="Scales LoRA updates during training; matching alpha to rank is a common baseline.",
+                )
+                network_dropout = gr.Slider(
+                    0, 1, value=0, step=0.01, label="Network dropout",
+                    info="Randomly drops LoRA activations to reduce overfitting. Zero disables it.",
+                )
 
         with gr.Accordion("Optimizer and training", open=False):
             with gr.Row():
-                learning_rate = gr.Number(value=0.0001, label="Learning rate")
+                learning_rate = gr.Number(
+                    value=0.0001, label="Learning rate",
+                    info="Size of each parameter update. Lower values train more gently.",
+                )
                 optimizer = gr.Dropdown(
                     ["adamw8bit", "adamw", "adafactor", "prodigy", "prodigy8bit"],
                     value="adamw8bit",
                     allow_custom_value=True,
                     label="Optimizer",
+                    info="Algorithm that updates LoRA weights; adamw8bit is the memory-efficient default.",
                 )
                 lr_scheduler = gr.Dropdown(
                     ["constant", "linear", "cosine", "cosine_with_restarts", "polynomial"],
                     value="constant",
                     allow_custom_value=True,
                     label="LR scheduler",
+                    info="How the learning rate changes over the course of training.",
                 )
             with gr.Row():
-                batch_size = gr.Slider(1, 16, value=1, step=1, label="Batch size")
-                gradient_accumulation = gr.Slider(1, 32, value=1, step=1, label="Gradient accumulation")
-                max_grad_norm = gr.Number(value=1.0, label="Max gradient norm")
+                batch_size = gr.Slider(
+                    1, 16, value=1, step=1, label="Batch size",
+                    info="Images processed simultaneously. Increase only when VRAM allows.",
+                )
+                gradient_accumulation = gr.Slider(
+                    1, 32, value=1, step=1, label="Gradient accumulation",
+                    info="Combines several batches before updating weights, simulating a larger batch.",
+                )
+                max_grad_norm = gr.Number(
+                    value=1.0, label="Max gradient norm",
+                    info="Clips unusually large gradients for training stability.",
+                )
             with gr.Row():
                 timestep_type = gr.Dropdown(
                     ["sigmoid", "linear", "lognorm_blend", "next_sample", "weighted", "one_step"],
                     value="sigmoid",
                     allow_custom_value=True,
                     label="Timestep type",
+                    info="Controls how diffusion timesteps are sampled during training.",
                 )
-                train_dtype = gr.Dropdown(["bf16", "fp16", "fp32"], value="bf16", label="Training dtype")
+                train_dtype = gr.Dropdown(
+                    ["bf16", "fp16", "fp32"], value="bf16", label="Training dtype",
+                    info="Numeric precision used for training; bf16 is recommended on modern GPUs.",
+                )
             with gr.Row():
-                gradient_checkpointing = gr.Checkbox(True, label="Gradient checkpointing")
-                cache_text_embeddings = gr.Checkbox(True, label="Cache text embeddings")
+                gradient_checkpointing = gr.Checkbox(
+                    True, label="Gradient checkpointing",
+                    info="Recomputes activations to substantially reduce VRAM usage.",
+                )
+                cache_text_embeddings = gr.Checkbox(
+                    True, label="Cache text embeddings",
+                    info="Encodes captions once to save VRAM and speed up repeated training steps.",
+                )
 
         with gr.Accordion("Dataset", open=False):
             with gr.Row():
-                caption_dropout_rate = gr.Slider(0, 1, value=0.05, step=0.01, label="Caption dropout")
-                token_dropout_rate = gr.Slider(0, 1, value=0, step=0.01, label="Token dropout")
-                shuffle_tokens = gr.Checkbox(False, label="Shuffle caption tokens")
-                keep_tokens = gr.Slider(0, 32, value=0, step=1, label="Keep leading tokens")
+                caption_dropout_rate = gr.Slider(
+                    0, 1, value=0.05, step=0.01, label="Caption dropout",
+                    info="Chance of training an image without its caption to reduce prompt dependence.",
+                )
+                token_dropout_rate = gr.Slider(
+                    0, 1, value=0, step=0.01, label="Token dropout",
+                    info="Chance of dropping individual caption tokens during training.",
+                )
+                shuffle_tokens = gr.Checkbox(
+                    False, label="Shuffle caption tokens",
+                    info="Randomizes comma-separated caption tags while training.",
+                )
+                keep_tokens = gr.Slider(
+                    0, 32, value=0, step=1, label="Keep leading tokens",
+                    info="Number of leading caption tokens never shuffled or dropped.",
+                )
             with gr.Row():
-                num_repeats = gr.Slider(1, 100, value=1, step=1, label="Dataset repeats")
-                random_crop = gr.Checkbox(False, label="Random crop")
-                flip_x = gr.Checkbox(False, label="Horizontal flip")
-                resolutions = gr.Textbox(value="512, 768, 1024", label="Resolution buckets")
+                num_repeats = gr.Slider(
+                    1, 100, value=1, step=1, label="Dataset repeats",
+                    info="Relative frequency with which this dataset is sampled.",
+                )
+                random_crop = gr.Checkbox(
+                    False, label="Random crop",
+                    info="Uses random image regions instead of a fixed centered crop.",
+                )
+                flip_x = gr.Checkbox(
+                    False, label="Horizontal flip",
+                    info="Randomly mirrors images; avoid when direction, text, or asymmetry matters.",
+                )
+                resolutions = gr.Textbox(
+                    value="512, 768, 1024", label="Resolution buckets",
+                    info="Comma-separated training sizes used to bucket different image aspect ratios.",
+                )
 
         with gr.Accordion("Saving and samples", open=False):
             with gr.Row():
-                save_every = gr.Number(value=250, precision=0, label="Save every N steps")
-                max_saves = gr.Slider(1, 20, value=2, step=1, label="Checkpoints to keep")
-                save_dtype = gr.Dropdown(["float16", "bf16", "float32"], value="float16", label="Saved weight dtype")
-                disable_sampling = gr.Checkbox(False, label="Disable samples")
+                save_every = gr.Number(
+                    value=250, precision=0, label="Save every N steps",
+                    info="Interval between intermediate LoRA checkpoints.",
+                )
+                max_saves = gr.Slider(
+                    1, 20, value=2, step=1, label="Checkpoints to keep",
+                    info="Maximum intermediate checkpoints retained on disk.",
+                )
+                save_dtype = gr.Dropdown(
+                    ["float16", "bf16", "float32"], value="float16", label="Saved weight dtype",
+                    info="Precision of the saved adapter; float16 is compact and broadly compatible.",
+                )
+                disable_sampling = gr.Checkbox(
+                    False, label="Disable samples",
+                    info="Skips verification images to reduce training interruptions.",
+                )
             with gr.Row():
-                sample_every = gr.Number(value=250, precision=0, label="Sample every N steps")
-                sample_prompt = gr.Textbox(label="Sample prompt", placeholder="[trigger], portrait photo, detailed")
-                sample_negative = gr.Textbox(value="blurry, low quality", label="Sample negative prompt")
+                sample_every = gr.Number(
+                    value=250, precision=0, label="Verify every N steps",
+                    info="Interval between generated verification images.",
+                )
+                sample_negative = gr.Textbox(
+                    value="blurry, low quality", label="Verification negative prompt",
+                    info="Qualities to discourage in verification images.",
+                )
             with gr.Row():
-                sample_width = gr.Slider(256, 2048, value=1024, step=32, label="Sample width")
-                sample_height = gr.Slider(256, 2048, value=1024, step=32, label="Sample height")
-                sample_steps = gr.Slider(1, 80, value=28, step=1, label="Sample steps")
-                sample_guidance = gr.Slider(0, 20, value=4, step=0.1, label="Sample guidance")
+                sample_width = gr.Slider(
+                    256, 2048, value=1024, step=32, label="Verification width",
+                    info="Width of progress images generated during training.",
+                )
+                sample_height = gr.Slider(
+                    256, 2048, value=1024, step=32, label="Verification height",
+                    info="Height of progress images generated during training.",
+                )
+                sample_steps = gr.Slider(
+                    1, 80, value=28, step=1, label="Verification steps",
+                    info="Denoising steps used for each verification image.",
+                )
+                sample_guidance = gr.Slider(
+                    0, 20, value=4, step=0.1, label="Verification guidance",
+                    info="How strongly verification images follow the prompt.",
+                )
             with gr.Row():
-                sample_seed = gr.Number(value=42, precision=0, label="Sample seed")
-                walk_seed = gr.Checkbox(False, label="Walk seed between prompts")
+                sample_seed = gr.Number(
+                    value=42, precision=0, label="Verification seed",
+                    info="Fixed random seed for comparable progress images.",
+                )
+                walk_seed = gr.Checkbox(
+                    False, label="Walk seed between prompts",
+                    info="Increments the seed for each verification prompt.",
+                )
 
         with gr.Accordion("Model and memory", open=False):
             with gr.Row():
-                quantize = gr.Checkbox(True, label="Quantize transformer")
+                quantize = gr.Checkbox(
+                    True, label="Quantize transformer",
+                    info="Loads lower-precision transformer weights to reduce VRAM usage.",
+                )
                 qtype = gr.Textbox(
                     value="uint4|ostris/accuracy_recovery_adapters/qwen_image_2512_torchao_uint4.safetensors",
                     label="Transformer quantization / ARA",
+                    info="Quantization format and optional accuracy-recovery adapter path.",
                 )
             with gr.Row():
-                quantize_text_encoder = gr.Checkbox(True, label="Quantize text encoder")
-                qtype_text_encoder = gr.Textbox(value="qfloat8", label="Text encoder quantization")
-                low_vram = gr.Checkbox(True, label="Low VRAM mode")
+                quantize_text_encoder = gr.Checkbox(
+                    True, label="Quantize text encoder",
+                    info="Uses lower-precision text-encoder weights to save VRAM.",
+                )
+                qtype_text_encoder = gr.Textbox(
+                    value="qfloat8", label="Text encoder quantization",
+                    info="Quantization format used for the text encoder.",
+                )
+                low_vram = gr.Checkbox(
+                    True, label="Low VRAM mode",
+                    info="Enables AI Toolkit memory-saving behavior for limited GPUs.",
+                )
 
         with gr.Accordion("All AI Toolkit parameters (advanced)", open=False):
             gr.Markdown(
@@ -637,8 +778,16 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
                 value="",
             )
 
+        with gr.Accordion("Look up an existing job", open=False):
+            with gr.Row():
+                check_name = gr.Textbox(
+                    label="Existing job name",
+                    info="Local job name whose current status and log you want to display.",
+                )
+                check_status = gr.Button("Check status")
+
         active_job = gr.State("")
-        train = gr.Button("Train and publish private LoRA", variant="primary")
+        train = gr.Button("Enter a job name to train", variant="primary", interactive=False)
         training_status = gr.Markdown("### Ready to train")
         training_log = gr.Code(
             value="Training output will appear here live.",
@@ -665,31 +814,76 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
             [image_files, name, trigger, caption, *training_controls],
             [training_status, active_job, training_log, train],
         )
-        check_name = gr.Textbox(label="Job name")
-        gr.Button("Check status").click(
+        check_status.click(
             job_view,
-            check_name,
+            [check_name, name, trigger, image_files],
             [training_status, training_log, train],
+        )
+        required_inputs = [name, trigger, image_files]
+        name.input(
+            training_button_state,
+            required_inputs,
+            train,
+            show_progress="hidden",
+        )
+        trigger.input(
+            training_button_state,
+            required_inputs,
+            train,
+            show_progress="hidden",
+        )
+        image_files.change(
+            training_button_state,
+            required_inputs,
+            train,
+            show_progress="hidden",
         )
         training_timer = gr.Timer(1.0, active=True)
         training_timer.tick(
             job_view,
-            active_job,
+            [active_job, name, trigger, image_files],
             [training_status, training_log, train],
             show_progress="hidden",
         )
     with gr.Tab("Generate"):
-        prompt = gr.Textbox(label="Prompt")
-        lora = gr.Textbox(label="LoRA name (private model slug or owner/repo)")
-        negative = gr.Textbox(label="Negative prompt")
+        prompt = gr.Textbox(
+            label="Prompt",
+            info="Description of the image to generate, including the LoRA trigger word when applicable.",
+        )
+        lora = gr.Textbox(
+            label="LoRA name (private model slug or owner/repo)",
+            info="Private adapter to load. Short names resolve under the configured Space owner.",
+        )
+        negative = gr.Textbox(
+            label="Negative prompt",
+            info="Optional qualities or content to discourage in the generated image.",
+        )
         with gr.Row():
-            width = gr.Slider(256, 2048, value=1024, step=32, label="Width")
-            height = gr.Slider(256, 2048, value=1024, step=32, label="Height")
-            infer_steps = gr.Slider(1, 80, value=28, step=1, label="Steps")
+            width = gr.Slider(
+                256, 2048, value=1024, step=32, label="Width",
+                info="Output width in pixels; larger images require more VRAM and time.",
+            )
+            height = gr.Slider(
+                256, 2048, value=1024, step=32, label="Height",
+                info="Output height in pixels; larger images require more VRAM and time.",
+            )
+            infer_steps = gr.Slider(
+                1, 80, value=28, step=1, label="Steps",
+                info="Number of denoising steps used to generate the image.",
+            )
         with gr.Row():
-            guidance = gr.Slider(0, 20, value=4, step=0.1, label="Guidance")
-            scale = gr.Slider(0, 2, value=0.8, step=0.05, label="LoRA scale")
-            seed = gr.Number(label="Seed (empty = random)", precision=0)
+            guidance = gr.Slider(
+                0, 20, value=4, step=0.1, label="Guidance",
+                info="Strength with which generation follows the text prompt.",
+            )
+            scale = gr.Slider(
+                0, 2, value=0.8, step=0.05, label="LoRA scale",
+                info="Influence of the selected LoRA on the generated image.",
+            )
+            seed = gr.Number(
+                label="Seed (empty = random)", precision=0,
+                info="Random seed for reproducible output; leave empty to choose one automatically.",
+            )
         run = gr.Button("Generate", variant="primary")
         image = gr.Image(label="Result")
         used_seed = gr.Number(label="Used seed", precision=0)
