@@ -638,8 +638,15 @@ def get_swin2sr():
     global swin2sr_processor, swin2sr_model
     with swin2sr_lock:
         if swin2sr_model is None:
-            from transformers import AutoImageProcessor, Swin2SRForImageSuperResolution
-            processor = AutoImageProcessor.from_pretrained(SWIN2SR_MODEL)
+            from transformers import Swin2SRForImageSuperResolution
+            try:
+                # Transformers 5 names the portable NumPy/PIL implementation explicitly.
+                from transformers import Swin2SRImageProcessorPil as Swin2SRProcessor
+            except ImportError:
+                # Transformers 4 used this name for the same non-Torchvision processor.
+                from transformers import Swin2SRImageProcessor as Swin2SRProcessor
+
+            processor = Swin2SRProcessor.from_pretrained(SWIN2SR_MODEL)
             model = Swin2SRForImageSuperResolution.from_pretrained(SWIN2SR_MODEL)
             model.eval().to("cuda")
             swin2sr_processor = processor

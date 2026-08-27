@@ -54,7 +54,7 @@ Set `HF_TOKEN` in **Settings → Variables and secrets**. It must have write acc
 }
 ```
 
-The response contains a PNG as base64 plus its dimensions, transparency status, upscaler details, and used seed. When `remove_background` is enabled, `rembg[gpu]` runs through ONNX Runtime's CUDA execution provider and returns a genuine alpha PNG. When `upscale_to_2k` is enabled, the app uses the `caidas/swin2SR-lightweight-x2-64` neural super-resolution model, preserves any alpha channel separately, and enlarges the longest edge to 2048 pixels without downscaling larger images. If Swin2SR cannot load or fit in memory, the response reports that it used the Lanczos fallback. LoRA names resolve to `jjmcarrascosa/<lora_name>`; fully-qualified private model IDs also work.
+The response contains a PNG as base64 plus its dimensions, transparency status, upscaler details, and used seed. When `remove_background` is enabled, `rembg[gpu]` runs through ONNX Runtime's CUDA execution provider and returns a genuine alpha PNG. When `upscale_to_2k` is enabled, the app uses the `caidas/swin2SR-lightweight-x2-64` neural super-resolution model with its portable PIL/NumPy processor, so Torchvision is not required. It preserves any alpha channel separately and enlarges the longest edge to 2048 pixels without downscaling larger images. If Swin2SR cannot load or fit in memory, the response reports that it used the Lanczos fallback. LoRA names resolve to `jjmcarrascosa/<lora_name>`; fully-qualified private model IDs also work.
 
 ## Hardware
 
