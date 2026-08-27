@@ -77,8 +77,10 @@ pipe = None
 loaded_lora = None
 swin2sr_processor = None
 swin2sr_model = None
+rembg_session = None
 pipe_lock = threading.Lock()
 swin2sr_lock = threading.Lock()
+rembg_lock = threading.Lock()
 toolkit_lock = threading.Lock()
 jobs_lock = threading.RLock()
 jobs: dict[str, dict] = {}
@@ -645,6 +647,33 @@ def get_swin2sr():
         return swin2sr_processor, swin2sr_model
 
 
+def get_rembg_cuda_session():
+    """Create one reusable rembg session and require its CUDA execution provider."""
+    global rembg_session
+    with rembg_lock:
+        if rembg_session is None:
+            try:
+                import onnxruntime as ort
+            except Exception as exc:
+                raise RuntimeError(
+                    "The rembg CUDA backend could not load. Rebuild the Space with "
+                    "the rembg[gpu] requirement."
+                ) from exc
+            providers = ort.get_available_providers()
+            if "CUDAExecutionProvider" not in providers:
+                raise RuntimeError(
+                    "onnxruntime-gpu loaded without CUDAExecutionProvider. "
+                    f"Available providers: {', '.join(providers) or 'none'}."
+                )
+            from rembg import new_session
+
+            rembg_session = new_session(
+                "u2net",
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            )
+        return rembg_session
+
+
 def run_swin2sr_tiled(image, tile_size=512, overlap=32):
     """Run learned x2 super-resolution in contextual tiles to control VRAM use."""
     from PIL import Image
@@ -727,10 +756,11 @@ def generate(request: GenerateRequest):
         generator = torch.Generator(device="cuda").manual_seed(seed)
         image = get_pipe(request.lora_name, request.lora_scale)(prompt=request.prompt, negative_prompt=request.negative_prompt or None, width=request.width, height=request.height, num_inference_steps=request.steps, true_cfg_scale=request.guidance_scale, generator=generator).images[0]
         if request.remove_background:
-            # Qwen Image produces RGB art; use segmentation to make a genuine alpha PNG.
-            # The rembg model downloads once on first request and remains cached by the Space.
+            # Qwen Image produces RGB art; use CUDA segmentation to make a genuine alpha PNG.
+            # The model downloads on first use and both model and session are then reused.
+            background_session = get_rembg_cuda_session()
             from rembg import remove
-            image = remove(image).convert("RGBA")
+            image = remove(image, session=background_session).convert("RGBA")
         upscaler = None
         upscale_warning = None
         if request.upscale_to_2k:
