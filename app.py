@@ -583,6 +583,33 @@ def job_view(lora_name: str, form_name: str = "", trigger_word: str = "", files=
     return summary, read_job_log(run_name), button, run_name
 
 
+def pipeline_has_adapter(pipeline, adapter_name: str) -> bool:
+    """Check Diffusers' real adapter registry instead of trusting our slug cache."""
+    try:
+        adapters = pipeline.get_list_adapters()
+        if isinstance(adapters, dict):
+            return any(adapter_name in names for names in adapters.values())
+        return adapter_name in adapters
+    except (AttributeError, TypeError, ValueError):
+        try:
+            return adapter_name in pipeline.get_active_adapters()
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+
+def clear_pipeline_lora_state() -> None:
+    global loaded_lora
+    loaded_lora = None
+    if pipe is None:
+        return
+    try:
+        pipe.unload_lora_weights()
+    except Exception:
+        # This is best-effort recovery after an incomplete third-party load.
+        # Keeping loaded_lora cleared forces another real load on the next request.
+        pass
+
+
 def get_pipe(lora_name: Optional[str], scale: float):
     global pipe, loaded_lora
     if not torch.cuda.is_available():
@@ -591,14 +618,24 @@ def get_pipe(lora_name: Optional[str], scale: float):
         if pipe is None:
             pipe = DiffusionPipeline.from_pretrained(BASE_MODEL, torch_dtype=torch.bfloat16, token=hf_token()).to("cuda")
         repo = lora_repo(lora_name) if lora_name else None
-        if repo != loaded_lora:
-            if loaded_lora:
-                pipe.unload_lora_weights()
-            if repo:
+        adapter_is_loaded = pipeline_has_adapter(pipe, "selected")
+        if repo is None:
+            if loaded_lora is not None or adapter_is_loaded:
+                clear_pipeline_lora_state()
+        elif repo != loaded_lora or not adapter_is_loaded:
+            clear_pipeline_lora_state()
+            try:
                 pipe.load_lora_weights(repo, weight_name="adapter.safetensors", token=hf_token(), adapter_name="selected")
                 pipe.set_adapters("selected", adapter_weights=scale)
+            except Exception:
+                clear_pipeline_lora_state()
+                raise
+            # Only cache the slug after Diffusers confirms the adapter exists.
+            if not pipeline_has_adapter(pipe, "selected"):
+                clear_pipeline_lora_state()
+                raise RuntimeError(f"LoRA `{repo}` loaded without registering the `selected` adapter.")
             loaded_lora = repo
-        elif repo:
+        else:
             pipe.set_adapters("selected", adapter_weights=scale)
         return pipe
 
