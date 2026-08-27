@@ -163,6 +163,7 @@ class GenerateRequest(BaseModel):
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     lora_scale: float = Field(default=0.8, ge=0, le=2)
     seed: Optional[int] = None
+    remove_background: bool = True
 
 
 def generate(request: GenerateRequest):
@@ -170,6 +171,11 @@ def generate(request: GenerateRequest):
         seed = int(request.seed if request.seed is not None else torch.seed() % (2**31 - 1))
         generator = torch.Generator(device="cuda").manual_seed(seed)
         image = get_pipe(request.lora_name, request.lora_scale)(prompt=request.prompt, negative_prompt=request.negative_prompt or None, width=request.width, height=request.height, num_inference_steps=request.steps, true_cfg_scale=request.guidance_scale, generator=generator).images[0]
+        if request.remove_background:
+            # Qwen Image produces RGB art; use segmentation to make a genuine alpha PNG.
+            # The rembg model downloads once on first request and remains cached by the Space.
+            from rembg import remove
+            image = remove(image).convert("RGBA")
         buffer = BytesIO()
         image.save(buffer, format="PNG")
         return {"seed": seed, "image_base64": base64.b64encode(buffer.getvalue()).decode("ascii"), "mime_type": "image/png"}
@@ -179,7 +185,7 @@ def generate(request: GenerateRequest):
 
 @spaces.GPU(duration=120)
 def generate_ui(prompt, lora_name, negative_prompt, width, height, steps, guidance, scale, seed):
-    result = generate(GenerateRequest(prompt=prompt, lora_name=lora_name or None, negative_prompt=negative_prompt, width=int(width), height=int(height), steps=int(steps), guidance_scale=float(guidance), lora_scale=float(scale), seed=int(seed) if seed else None))
+    result = generate(GenerateRequest(prompt=prompt, lora_name=lora_name or None, negative_prompt=negative_prompt, width=int(width), height=int(height), steps=int(steps), guidance_scale=float(guidance), lora_scale=float(scale), seed=int(seed) if seed else None, remove_background=True))
     from PIL import Image
     return Image.open(BytesIO(base64.b64decode(result["image_base64"]))), result["seed"]
 
