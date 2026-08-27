@@ -32,10 +32,13 @@ BASE_MODEL = "Qwen/Qwen-Image-2512"
 OWNER = os.getenv("HF_SPACE_OWNER", "jjmcarrascosa")
 ROOT = Path(os.getenv("SPACE_WORKDIR", "/tmp/qwen-image-lora-studio"))
 TOOLKIT = ROOT / "ai-toolkit"
+TOOLKIT_VENV = ROOT / ".ai-toolkit-venv"
 JOBS = ROOT / "jobs"
 JOBS.mkdir(parents=True, exist_ok=True)
-TOOLKIT_INSTALL_MARKER = TOOLKIT / ".studio-dependencies-installed"
+TOOLKIT_INSTALL_MARKER = TOOLKIT_VENV / ".studio-dependencies-installed-v1"
 GALLERY_PAGE_SIZE = 12
+MAX_JOB_LOG_CHARS = 100_000
+ACTIVE_JOB_STATUSES = {"preparing images", "queued", "installing AI Toolkit", "training", "publishing"}
 TRAINING_PARAM_NAMES = (
     "steps", "rank", "alpha", "network_dropout", "learning_rate", "optimizer",
     "lr_scheduler", "batch_size", "gradient_accumulation", "max_grad_norm",
@@ -52,6 +55,7 @@ pipe = None
 loaded_lora = None
 pipe_lock = threading.Lock()
 toolkit_lock = threading.Lock()
+jobs_lock = threading.RLock()
 jobs: dict[str, dict] = {}
 
 
@@ -73,28 +77,74 @@ def lora_repo(name: str) -> str:
     return name if "/" in name else f"{OWNER}/{slug(name)}"
 
 
-def run_checked(command: list[str], cwd: Optional[Path] = None) -> str:
-    result = subprocess.run(
+def append_job_log(run_name: str, message: str) -> None:
+    with jobs_lock:
+        job = jobs.get(run_name)
+        if job is None:
+            return
+        job["log"] = (job.get("log", "") + message)[-MAX_JOB_LOG_CHARS:]
+        job["updated_at"] = time.time()
+
+
+def set_job_status(run_name: str, status_value: str, message: Optional[str] = None) -> None:
+    with jobs_lock:
+        jobs[run_name]["status"] = status_value
+        jobs[run_name]["updated_at"] = time.time()
+    if message:
+        append_job_log(run_name, f"\n[{time.strftime('%H:%M:%S')}] {message}\n")
+
+
+def run_checked(command: list[str], cwd: Optional[Path] = None, on_output=None) -> str:
+    process = subprocess.Popen(
         command,
         cwd=cwd,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        bufsize=1,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
-    if result.returncode:
-        output = result.stdout[-12000:]
-        raise RuntimeError(f"Command failed ({' '.join(command)}):\n{output}")
-    return result.stdout
+    output_tail = ""
+    assert process.stdout is not None
+    for line in process.stdout:
+        output_tail = (output_tail + line)[-12000:]
+        if on_output:
+            on_output(line)
+    return_code = process.wait()
+    if return_code:
+        raise RuntimeError(f"Command failed ({' '.join(command)}):\n{output_tail}")
+    return output_tail
 
 
-def ensure_toolkit() -> None:
+def toolkit_python() -> Path:
+    scripts_dir = "Scripts" if os.name == "nt" else "bin"
+    executable = "python.exe" if os.name == "nt" else "python"
+    return TOOLKIT_VENV / scripts_dir / executable
+
+
+def ensure_toolkit(run_name: Optional[str] = None) -> None:
+    emit = (lambda line: append_job_log(run_name, line)) if run_name else None
     with toolkit_lock:
         if not (TOOLKIT / "run.py").exists():
             if TOOLKIT.exists():
                 raise RuntimeError(f"AI Toolkit checkout is incomplete at {TOOLKIT}. Restart the Space to rebuild /tmp.")
-            run_checked(["git", "clone", "--depth", "1", "https://github.com/ostris/ai-toolkit.git", str(TOOLKIT)])
+            run_checked(
+                ["git", "clone", "--depth", "1", "https://github.com/ostris/ai-toolkit.git", str(TOOLKIT)],
+                on_output=emit,
+            )
+        if not toolkit_python().exists():
+            run_checked(
+                [sys.executable, "-m", "venv", "--system-site-packages", str(TOOLKIT_VENV)],
+                on_output=emit,
+            )
         if not TOOLKIT_INSTALL_MARKER.exists():
-            run_checked([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], cwd=TOOLKIT)
+            run_checked(
+                [str(toolkit_python()), "-m", "pip", "install", "-r", "requirements.txt"],
+                cwd=TOOLKIT,
+                on_output=emit,
+            )
             TOOLKIT_INSTALL_MARKER.touch()
 
 
@@ -236,29 +286,32 @@ def qwen_config(run_name: str, image_dir: Path, trigger_word: str, options: dict
 
 
 def run_training(run_name: str, image_dir: Path, config: dict) -> None:
-    job = jobs[run_name]
     try:
         hf_token()
-        job["status"] = "installing AI Toolkit"
-        ensure_toolkit()
+        set_job_status(run_name, "installing AI Toolkit", "Preparing the isolated AI Toolkit environment…")
+        ensure_toolkit(run_name)
         config_file = JOBS / f"{run_name}.yaml"
         config_file.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
-        job["status"] = "training"
-        result = subprocess.run([sys.executable, "run.py", str(config_file)], cwd=TOOLKIT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        job["log"] = result.stdout[-12000:]
-        if result.returncode:
-            raise RuntimeError(f"AI Toolkit exited with code {result.returncode}")
+        set_job_status(run_name, "training", f"Starting AI Toolkit with {config_file.name}…")
+        run_checked(
+            [str(toolkit_python()), "run.py", str(config_file)],
+            cwd=TOOLKIT,
+            on_output=lambda line: append_job_log(run_name, line),
+        )
         weights = sorted((JOBS / run_name).rglob("*.safetensors"), key=lambda p: p.stat().st_mtime)
         if not weights:
             raise RuntimeError("AI Toolkit completed but did not produce a .safetensors LoRA.")
+        set_job_status(run_name, "publishing", "Training completed. Publishing the adapter privately…")
         api = HfApi(token=hf_token())
         repo_id = lora_repo(run_name)
         api.create_repo(repo_id=repo_id, repo_type="model", private=True, exist_ok=True)
         api.upload_file(path_or_fileobj=str(weights[-1]), path_in_repo="adapter.safetensors", repo_id=repo_id, repo_type="model", commit_message=f"Publish private Qwen Image LoRA {run_name}")
         api.upload_file(path_or_fileobj=str(config_file), path_in_repo="training_config.yaml", repo_id=repo_id, repo_type="model", commit_message="Add training configuration")
-        job.update(status="published", repo_id=repo_id, log=job.get("log", "") + f"\nPublished privately to {repo_id}")
+        with jobs_lock:
+            jobs[run_name]["repo_id"] = repo_id
+        set_job_status(run_name, "published", f"Published privately to {repo_id}")
     except Exception as exc:
-        job.update(status="failed", log=job.get("log", "") + f"\nERROR: {exc}")
+        set_job_status(run_name, "failed", f"ERROR: {str(exc)[-12000:]}")
 
 
 def start_training(files, lora_name: str, trigger_word: str, caption: str, *param_values):
@@ -269,10 +322,20 @@ def start_training(files, lora_name: str, trigger_word: str, caption: str, *para
     try:
         run_name = slug(lora_name)
         options = dict(zip(TRAINING_PARAM_NAMES, param_values, strict=True))
-        config = qwen_config(run_name, JOBS / run_name / "images", trigger_word.strip(), options)
+        image_dir = JOBS / run_name / f"images-{time.time_ns()}"
+        config = qwen_config(run_name, image_dir, trigger_word.strip(), options)
     except (TypeError, ValueError, yaml.YAMLError) as exc:
         raise gr.Error(str(exc)) from exc
-    image_dir = JOBS / run_name / "images"
+    with jobs_lock:
+        active_jobs = [name for name, job in jobs.items() if job.get("status") in ACTIVE_JOB_STATUSES]
+        if active_jobs:
+            raise gr.Error(f"Training is already running for `{active_jobs[0]}`. Wait for it to finish before starting another job.")
+        jobs[run_name] = {
+            "status": "preparing images",
+            "repo_id": lora_repo(run_name),
+            "log": f"[{time.strftime('%H:%M:%S')}] Preparing uploaded images…\n",
+            "updated_at": time.time(),
+        }
     image_dir.mkdir(parents=True, exist_ok=True)
     from PIL import Image, ImageOps
     image_caption = caption.strip() or trigger_word.strip()
@@ -285,11 +348,17 @@ def start_training(files, lora_name: str, trigger_word: str, caption: str, *para
             with Image.open(source) as uploaded:
                 ImageOps.exif_transpose(uploaded).convert("RGB").save(target, format="PNG")
         except Exception as exc:
+            set_job_status(run_name, "failed", f"ERROR: Could not read {source.name}: {exc}")
             raise gr.Error(f"Could not read {source.name}: {exc}") from exc
         target.with_suffix(".txt").write_text(image_caption, encoding="utf-8")
-    jobs[run_name] = {"status": "queued", "repo_id": lora_repo(run_name), "log": "Queued"}
+    set_job_status(run_name, "queued", f"Queued {len(files)} training images.")
     threading.Thread(target=run_training, args=(run_name, image_dir, config), daemon=True).start()
-    return f"Queued `{run_name}`. It will publish privately to `{lora_repo(run_name)}` when complete."
+    return (
+        f"### ⏳ Queued `{run_name}`\nIt will publish privately to `{lora_repo(run_name)}` when complete.",
+        run_name,
+        jobs[run_name]["log"],
+        gr.update(interactive=False, value="Training in progress…"),
+    )
 
 
 def gallery_page(files, page: int = 1):
@@ -321,9 +390,24 @@ def clear_gallery():
     return [], items, page, summary, previous, following
 
 
-def status(lora_name: str) -> str:
-    job = jobs.get(slug(lora_name))
-    return "No local job found." if job is None else yaml.safe_dump(job, sort_keys=False)
+def job_view(lora_name: str):
+    with jobs_lock:
+        any_active = any(job.get("status") in ACTIVE_JOB_STATUSES for job in jobs.values())
+        try:
+            job = copy.deepcopy(jobs.get(slug(lora_name))) if lora_name else None
+        except ValueError:
+            job = None
+    button = gr.update(
+        interactive=not any_active,
+        value="Training in progress…" if any_active else "Train and publish private LoRA",
+    )
+    if job is None:
+        return "### No local job found", "Enter a job name or start training to view its live log.", button
+    status_value = job.get("status", "unknown")
+    icon = "✅" if status_value == "published" else "❌" if status_value == "failed" else "⏳"
+    repo_id = job.get("repo_id", "")
+    summary = f"### {icon} `{lora_name}` — {status_value}\nPrivate destination: `{repo_id}`"
+    return summary, job.get("log", "No log output yet."), button
 
 
 def get_pipe(lora_name: Optional[str], scale: float):
@@ -534,8 +618,19 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
                 value="",
             )
 
+        active_job = gr.State("")
         train = gr.Button("Train and publish private LoRA", variant="primary")
-        train_result = gr.Markdown()
+        training_status = gr.Markdown("### Ready to train")
+        training_log = gr.Code(
+            value="Training output will appear here live.",
+            language="shell",
+            lines=28,
+            max_lines=40,
+            label="Live training log",
+            interactive=False,
+            show_line_numbers=False,
+            wrap_lines=True,
+        )
         training_controls = [
             steps, rank, alpha, network_dropout, learning_rate, optimizer, lr_scheduler,
             batch_size, gradient_accumulation, max_grad_norm, timestep_type, train_dtype,
@@ -546,9 +641,24 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
             sample_steps, sample_guidance, sample_seed, walk_seed, quantize, qtype,
             quantize_text_encoder, qtype_text_encoder, low_vram, advanced_yaml,
         ]
-        train.click(start_training, [image_files, name, trigger, caption, *training_controls], train_result)
+        train.click(
+            start_training,
+            [image_files, name, trigger, caption, *training_controls],
+            [training_status, active_job, training_log, train],
+        )
         check_name = gr.Textbox(label="Job name")
-        gr.Button("Check status").click(status, check_name, train_result)
+        gr.Button("Check status").click(
+            job_view,
+            check_name,
+            [training_status, training_log, train],
+        )
+        training_timer = gr.Timer(1.0, active=True)
+        training_timer.tick(
+            job_view,
+            active_job,
+            [training_status, training_log, train],
+            show_progress="hidden",
+        )
     with gr.Tab("Generate"):
         prompt = gr.Textbox(label="Prompt")
         lora = gr.Textbox(label="LoRA name (private model slug or owner/repo)")
@@ -569,4 +679,4 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
 demo.app.add_api_route("/v1/generate", generate, methods=["POST"], response_model=None)
 
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=1).launch(server_name="0.0.0.0")
+    demo.queue(default_concurrency_limit=1).launch(server_name="0.0.0.0", ssr_mode=False)
