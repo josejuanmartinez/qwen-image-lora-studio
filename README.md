@@ -28,6 +28,7 @@ network:
 
 The Space intentionally uses Python 3.11 because AI Toolkit currently pins SciPy 1.12, which does not provide Python 3.13 wheels.
 AI Toolkit is installed in an isolated virtual environment so its pinned dependencies cannot modify the running Gradio application. The Train tab streams installation and trainer output into a large live console and prevents another training submission while a job is active.
+The toolkit environment also pins `kernels==0.12.3`, matching the API required by its Transformers 5.5.x dependency.
 
 ## Space secrets
 

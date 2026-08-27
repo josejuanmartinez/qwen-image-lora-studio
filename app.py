@@ -35,7 +35,8 @@ TOOLKIT = ROOT / "ai-toolkit"
 TOOLKIT_VENV = ROOT / ".ai-toolkit-venv"
 JOBS = ROOT / "jobs"
 JOBS.mkdir(parents=True, exist_ok=True)
-TOOLKIT_INSTALL_MARKER = TOOLKIT_VENV / ".studio-dependencies-installed-v1"
+TOOLKIT_INSTALL_MARKER = TOOLKIT_VENV / ".studio-dependencies-installed-v2"
+TOOLKIT_COMPAT_PACKAGES = ["kernels==0.12.3"]
 GALLERY_PAGE_SIZE = 12
 MAX_JOB_LOG_CHARS = 100_000
 ACTIVE_JOB_STATUSES = {"preparing images", "queued", "installing AI Toolkit", "training", "publishing"}
@@ -142,6 +143,24 @@ def ensure_toolkit(run_name: Optional[str] = None) -> None:
         if not TOOLKIT_INSTALL_MARKER.exists():
             run_checked(
                 [str(toolkit_python()), "-m", "pip", "install", "-r", "requirements.txt"],
+                cwd=TOOLKIT,
+                on_output=emit,
+            )
+            # Transformers 5.5.x expects the kernels 0.12 LayerRepository API. The
+            # Space inference environment may provide a newer, incompatible release
+            # through --system-site-packages, so shadow it inside the toolkit venv.
+            run_checked(
+                [str(toolkit_python()), "-m", "pip", "install", *TOOLKIT_COMPAT_PACKAGES],
+                cwd=TOOLKIT,
+                on_output=emit,
+            )
+            run_checked(
+                [
+                    str(toolkit_python()),
+                    "-c",
+                    "from transformers import T5Tokenizer, T5EncoderModel, UMT5EncoderModel; "
+                    "print('AI Toolkit dependency check passed')",
+                ],
                 cwd=TOOLKIT,
                 on_output=emit,
             )
