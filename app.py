@@ -35,7 +35,7 @@ TOOLKIT = ROOT / "ai-toolkit"
 TOOLKIT_VENV = ROOT / ".ai-toolkit-venv"
 JOBS = ROOT / "jobs"
 JOBS.mkdir(parents=True, exist_ok=True)
-TOOLKIT_INSTALL_MARKER = TOOLKIT_VENV / ".studio-dependencies-installed-v3"
+TOOLKIT_INSTALL_MARKER = TOOLKIT_VENV / ".studio-dependencies-installed-v4"
 TOOLKIT_COMPAT_PACKAGES = ["kernels==0.12.3"]
 GALLERY_PAGE_SIZE = 12
 MAX_JOB_LOG_CHARS = 100_000
@@ -147,6 +147,19 @@ def toolkit_torch_version() -> str:
     return version
 
 
+def compatible_torchaudio_version(torch_version: str) -> str:
+    major, minor, _patch = (int(part) for part in torch_version.split(".")[:3])
+    # TorchAudio 2.11 adopted PyTorch's stable ABI and supports PyTorch 2.11+
+    # without requiring a same-numbered TorchAudio release.
+    if (major, minor) >= (2, 11):
+        return "2.11.0"
+    if torch_version == "2.0.1":
+        return "2.0.2"
+    if torch_version == "2.0.0":
+        return "2.0.1"
+    return torch_version
+
+
 def ensure_toolkit(run_name: Optional[str] = None) -> None:
     emit = (lambda line: append_job_log(run_name, line)) if run_name else None
     with toolkit_lock:
@@ -177,8 +190,9 @@ def ensure_toolkit(run_name: Optional[str] = None) -> None:
                 on_output=emit,
             )
             torch_version = toolkit_torch_version()
+            torchaudio_version = compatible_torchaudio_version(torch_version)
             if emit:
-                emit(f"Installing torchaudio {torch_version} to match PyTorch {torch_version}\n")
+                emit(f"Installing torchaudio {torchaudio_version} for PyTorch {torch_version}\n")
             run_checked(
                 [
                     str(toolkit_python()),
@@ -186,7 +200,7 @@ def ensure_toolkit(run_name: Optional[str] = None) -> None:
                     "pip",
                     "install",
                     "--no-deps",
-                    f"torchaudio=={torch_version}",
+                    f"torchaudio=={torchaudio_version}",
                 ],
                 cwd=TOOLKIT,
                 on_output=emit,
