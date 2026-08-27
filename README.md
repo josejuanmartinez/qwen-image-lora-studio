@@ -5,6 +5,7 @@ colorFrom: indigo
 colorTo: purple
 sdk: gradio
 sdk_version: 6.26.0
+python_version: 3.11
 app_file: app.py
 pinned: false
 ---
@@ -12,6 +13,20 @@ pinned: false
 # Private Qwen Image LoRA Studio
 
 Train private Qwen-Image-2512 LoRAs with [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit), then run them through the UI or `POST /v1/generate`.
+
+The Train tab keeps uploaded images in a paginated thumbnail gallery. Common LoRA, optimizer, dataset, sampling, quantization, and checkpoint settings are available in collapsed advanced sections. The final **All AI Toolkit parameters** section accepts optional YAML that is merged into the generated `sd_trainer` configuration, for example:
+
+```yaml
+train:
+  optimizer_params:
+    weight_decay: 0.01
+  noise_offset: 0.05
+network:
+  network_kwargs:
+    only_if_contains: [attn]
+```
+
+The Space intentionally uses Python 3.11 because AI Toolkit currently pins SciPy 1.12, which does not provide Python 3.13 wheels.
 
 ## Space secrets
 
