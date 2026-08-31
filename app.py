@@ -467,7 +467,80 @@ def run_training(run_name: str, image_dir: Path, config: dict) -> None:
         set_job_status(run_name, "failed", f"ERROR: {str(exc)[-12000:]}")
 
 
-def start_training(files, lora_name: str, trigger_word: str, caption: str, *param_values):
+def flatten_to_white(image):
+    """Composite any transparency onto white before training sees the image.
+
+    PIL's convert("RGB") only drops the alpha channel; it keeps whatever RGB was
+    hidden underneath. Background-removed PNGs therefore bleed their original
+    background straight back into the dataset. Compositing replaces it instead.
+    """
+    from PIL import Image
+    if image.mode == "P":
+        image = image.convert("RGBA") if "transparency" in image.info else image.convert("RGB")
+    if image.mode in ("RGBA", "LA"):
+        image = image.convert("RGBA")
+        backdrop = Image.new("RGBA", image.size, (255, 255, 255, 255))
+        image = Image.alpha_composite(backdrop, image)
+    return image.convert("RGB")
+
+
+CAPTION_SUFFIX = ".txt"
+
+
+def caption_for(source: Path, typed: dict) -> str | None:
+    """Caption typed into the gallery field, else a .txt sitting beside the image."""
+    text = (typed or {}).get(str(source))
+    if text and text.strip():
+        return text.strip()
+    neighbour = source.with_suffix(CAPTION_SUFFIX)
+    if neighbour.is_file():
+        try:
+            return neighbour.read_text(encoding="utf-8").strip() or None
+        except (OSError, UnicodeDecodeError):
+            return None
+    return None
+
+
+def with_trigger(text: str, trigger_word: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return trigger_word
+    if trigger_word.lower() in text.lower():
+        return text
+    return f"{trigger_word}, {text}"
+
+
+def caption_progress(captions, files) -> str:
+    files = list(files or [])
+    captions = captions or {}
+    if not files:
+        return "Add images, then describe each one in the field under its thumbnail."
+    done = sum(1 for item in files if (captions.get(item) or "").strip())
+    if done == 0:
+        return f"0 of {len(files)} images captioned - all will fall back to the shared caption below."
+    if done == len(files):
+        return f"All {len(files)} images captioned."
+    return f"{done} of {len(files)} images captioned - the other {len(files) - done} will use the shared caption below."
+
+
+def set_slot_caption(index: int):
+    """Write one gallery field back into the path -> caption map."""
+    def handler(text, captions, files, page):
+        files = list(files or [])
+        start = (max(1, int(page or 1)) - 1) * GALLERY_PAGE_SIZE
+        window = files[start:start + GALLERY_PAGE_SIZE]
+        updated = dict(captions or {})
+        if index < len(window):
+            text = (text or "").strip()
+            if text:
+                updated[window[index]] = text
+            else:
+                updated.pop(window[index], None)
+        return updated, caption_progress(updated, files)
+    return handler
+
+
+def start_training(files, lora_name: str, trigger_word: str, caption: str, image_caption_map, *param_values):
     lora_name = (lora_name or "").strip()
     trigger_word = (trigger_word or "").strip()
     caption = caption or ""
@@ -500,20 +573,37 @@ def start_training(files, lora_name: str, trigger_word: str, caption: str, *para
         LATEST_JOB_FILE.write_text(run_name, encoding="utf-8")
     image_dir.mkdir(parents=True, exist_ok=True)
     from PIL import Image, ImageOps
-    image_caption = caption.strip() or trigger_word
-    if trigger_word.lower() not in image_caption.lower():
-        image_caption = f"{trigger_word}, {image_caption}"
+    shared_caption = caption.strip() or trigger_word
+    typed_captions = dict(image_caption_map or {})
+    flattened_count = 0
+    sidecar_count = 0
     for index, path in enumerate(files):
         source = Path(path[0] if isinstance(path, (tuple, list)) else path)
         target = image_dir / f"{index:04d}.png"
         try:
             with Image.open(source) as uploaded:
-                ImageOps.exif_transpose(uploaded).convert("RGB").save(target, format="PNG")
+                oriented = ImageOps.exif_transpose(uploaded)
+                if oriented.mode in ("RGBA", "LA") or (oriented.mode == "P" and "transparency" in oriented.info):
+                    flattened_count += 1
+                flatten_to_white(oriented).save(target, format="PNG")
         except Exception as exc:
             set_job_status(run_name, "failed", f"ERROR: Could not read {source.name}: {exc}")
             raise gr.Error(f"Could not read {source.name}: {exc}") from exc
-        target.with_suffix(".txt").write_text(image_caption, encoding="utf-8")
-    set_job_status(run_name, "queued", f"Queued {len(files)} training images.")
+        per_image = caption_for(source, typed_captions)
+        if per_image:
+            sidecar_count += 1
+        target.with_suffix(".txt").write_text(
+            with_trigger(per_image or shared_caption, trigger_word), encoding="utf-8"
+        )
+    notes = [f"Queued {len(files)} training images."]
+    if flattened_count:
+        notes.append(f"Composited transparency onto white for {flattened_count} image(s).")
+    notes.append(
+        f"Used per-image captions for {sidecar_count} of {len(files)} images."
+        if sidecar_count
+        else "No per-image captions found; all images share one caption."
+    )
+    set_job_status(run_name, "queued", " ".join(notes))
     threading.Thread(target=run_training, args=(run_name, image_dir, config), daemon=True).start()
     return (
         f"### ⏳ Queued `{run_name}`\nIt will publish privately to `{lora_repo(run_name)}` when complete.",
@@ -523,33 +613,53 @@ def start_training(files, lora_name: str, trigger_word: str, caption: str, *para
     )
 
 
-def gallery_page(files, page: int = 1):
+def gallery_page(files, page: int = 1, captions=None):
     files = list(files or [])
     page_count = max(1, (len(files) + GALLERY_PAGE_SIZE - 1) // GALLERY_PAGE_SIZE)
     page = min(max(1, int(page or 1)), page_count)
     start = (page - 1) * GALLERY_PAGE_SIZE
-    items = [(path, Path(path).name) for path in files[start:start + GALLERY_PAGE_SIZE]]
+    window = files[start:start + GALLERY_PAGE_SIZE]
+    captions = captions or {}
+    slots = []
+    for offset in range(GALLERY_PAGE_SIZE):
+        if offset < len(window):
+            path = window[offset]
+            slots.append(gr.update(visible=True))
+            slots.append(gr.update(value=path, label=Path(path).name))
+            slots.append(gr.update(value=captions.get(path, "")))
+        else:
+            slots.append(gr.update(visible=False))
+            slots.append(gr.update(value=None, label=""))
+            slots.append(gr.update(value=""))
     summary = f"Page {page} of {page_count} · {len(files)} image{'s' if len(files) != 1 else ''}"
-    return items, page, summary, gr.update(interactive=page > 1), gr.update(interactive=page < page_count)
+    return (
+        *slots,
+        page,
+        summary,
+        gr.update(interactive=page > 1),
+        gr.update(interactive=page < page_count),
+    )
 
 
-def add_gallery_files(new_files, existing_files):
+def add_gallery_files(new_files, existing_files, captions):
     accumulated = list(existing_files or [])
     for path in new_files or []:
         path = str(path)
         if path not in accumulated:
             accumulated.append(path)
-    items, page, summary, previous, following = gallery_page(accumulated, 1)
-    return accumulated, items, page, summary, previous, following
+    return (
+        accumulated,
+        caption_progress(captions, accumulated),
+        *gallery_page(accumulated, 1, captions),
+    )
 
 
-def change_gallery_page(files, page: int, delta: int):
-    return gallery_page(files, int(page or 1) + delta)
+def change_gallery_page(files, page: int, delta: int, captions):
+    return gallery_page(files, int(page or 1) + delta, captions)
 
 
 def clear_gallery():
-    items, page, summary, previous, following = gallery_page([], 1)
-    return [], items, page, summary, previous, following
+    return [], {}, caption_progress({}, []), *gallery_page([], 1, {})
 
 
 def training_button_state(lora_name: str, trigger_word: str, files):
@@ -650,6 +760,8 @@ class GenerateRequest(BaseModel):
     guidance_scale: float = Field(default=4.0, ge=0, le=20)
     lora_scale: float = Field(default=0.8, ge=0, le=2)
     seed: Optional[int] = None
+    scheduler: Optional[str] = None
+    base_model: Optional[str] = None
     remove_background: bool = True
     upscale_to_2k: bool = False
 
@@ -796,9 +908,35 @@ def upscale_image_to_2k(image):
 
 def generate(request: GenerateRequest):
     try:
+        if request.base_model is not None and request.base_model != BASE_MODEL:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Requested base model {request.base_model!r}, "
+                    f"but the Space uses {BASE_MODEL!r}."
+                ),
+            )
         seed = int(request.seed if request.seed is not None else torch.seed() % (2**31 - 1))
         generator = torch.Generator(device="cuda").manual_seed(seed)
-        image = get_pipe(request.lora_name, request.lora_scale)(prompt=request.prompt, negative_prompt=request.negative_prompt or None, width=request.width, height=request.height, num_inference_steps=request.steps, true_cfg_scale=request.guidance_scale, generator=generator).images[0]
+        selected_pipe = get_pipe(request.lora_name, request.lora_scale)
+        scheduler = selected_pipe.scheduler.__class__.__name__
+        if request.scheduler is not None and request.scheduler != scheduler:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Requested scheduler {request.scheduler!r}, "
+                    f"but the Space uses {scheduler!r}."
+                ),
+            )
+        image = selected_pipe(
+            prompt=request.prompt,
+            negative_prompt=request.negative_prompt or None,
+            width=request.width,
+            height=request.height,
+            num_inference_steps=request.steps,
+            true_cfg_scale=request.guidance_scale,
+            generator=generator,
+        ).images[0]
         if request.remove_background:
             # Qwen Image produces RGB art; use CUDA segmentation to make a genuine alpha PNG.
             # The model downloads on first use and both model and session are then reused.
@@ -831,7 +969,20 @@ def generate(request: GenerateRequest):
             "upscale_warning": upscale_warning,
             "image_base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
             "mime_type": "image/png",
+            "generation_parameters": {
+                "prompt": request.prompt,
+                "lora_name": request.lora_name,
+                "negative_prompt": request.negative_prompt,
+                "steps": request.steps,
+                "guidance_scale": request.guidance_scale,
+                "lora_scale": request.lora_scale,
+                "seed": seed,
+                "scheduler": scheduler,
+                "base_model": BASE_MODEL,
+            },
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -863,6 +1014,7 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
     gr.Markdown("# Qwen Image LoRA Studio\nPrivate Qwen-Image-2512 LoRA training via ostris AI Toolkit.")
     with gr.Tab("Train"):
         image_files = gr.State([])
+        image_captions = gr.State({})
         gallery_page_number = gr.State(1)
         with gr.Row():
             upload = gr.UploadButton(
@@ -873,22 +1025,39 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
                 variant="primary",
             )
             clear_images = gr.Button("Clear images")
-        training_gallery = gr.Gallery(
-            label="Training images",
-            value=[],
-            columns=4,
-            rows=3,
-            height=600,
-            object_fit="cover",
-            preview=True,
-            interactive=False,
+        caption_status = gr.Markdown(
+            "Add images, then describe each one in the field under its thumbnail."
         )
+        slot_columns, slot_images, slot_captions = [], [], []
+        for _row in range(GALLERY_PAGE_SIZE // 4):
+            with gr.Row():
+                for _col in range(4):
+                    with gr.Column(visible=False, min_width=180) as slot_column:
+                        slot_image = gr.Image(
+                            interactive=False,
+                            height=220,
+                            show_download_button=False,
+                            show_share_button=False,
+                        )
+                        slot_caption = gr.Textbox(
+                            placeholder="Describe this image…",
+                            lines=2,
+                            max_lines=4,
+                            show_label=False,
+                            container=False,
+                        )
+                    slot_columns.append(slot_column)
+                    slot_images.append(slot_image)
+                    slot_captions.append(slot_caption)
         with gr.Row():
             previous_page = gr.Button("Previous", interactive=False)
             gallery_summary = gr.Markdown("Page 1 of 1 · 0 images")
             next_page = gr.Button("Next", interactive=False)
+        slot_outputs = []
+        for slot_column, slot_image, slot_caption in zip(slot_columns, slot_images, slot_captions):
+            slot_outputs.extend([slot_column, slot_image, slot_caption])
         gallery_outputs = [
-            training_gallery,
+            *slot_outputs,
             gallery_page_number,
             gallery_summary,
             previous_page,
@@ -896,20 +1065,33 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
         ]
         upload.upload(
             add_gallery_files,
-            [upload, image_files],
-            [image_files, *gallery_outputs],
+            [upload, image_files, image_captions],
+            [image_files, caption_status, *gallery_outputs],
         )
+        for slot_index, slot_caption in enumerate(slot_captions):
+            slot_caption.change(
+                set_slot_caption(slot_index),
+                [slot_caption, image_captions, image_files, gallery_page_number],
+                [image_captions, caption_status],
+            )
         previous_page.click(
-            lambda current_files, current_page: change_gallery_page(current_files, current_page, -1),
-            [image_files, gallery_page_number],
+            lambda current_files, current_page, captions: change_gallery_page(
+                current_files, current_page, -1, captions
+            ),
+            [image_files, gallery_page_number, image_captions],
             gallery_outputs,
         )
         next_page.click(
-            lambda current_files, current_page: change_gallery_page(current_files, current_page, 1),
-            [image_files, gallery_page_number],
+            lambda current_files, current_page, captions: change_gallery_page(
+                current_files, current_page, 1, captions
+            ),
+            [image_files, gallery_page_number, image_captions],
             gallery_outputs,
         )
-        clear_images.click(clear_gallery, outputs=[image_files, *gallery_outputs])
+        clear_images.click(
+            clear_gallery,
+            outputs=[image_files, image_captions, caption_status, *gallery_outputs],
+        )
 
         with gr.Row():
             name = gr.Textbox(
@@ -1169,7 +1351,7 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
         ]
         train.click(
             start_training,
-            [image_files, name, trigger, caption, *training_controls],
+            [image_files, name, trigger, caption, image_captions, *training_controls],
             [training_status, active_job, training_log, train],
         )
         check_status.click(

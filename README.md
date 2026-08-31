@@ -49,12 +49,14 @@ Set `HF_TOKEN` in **Settings → Variables and secrets**. It must have write acc
   "guidance_scale": 4.0,
   "lora_scale": 0.8,
   "seed": 42,
+  "scheduler": null,
+  "base_model": null,
   "remove_background": true,
-  "upscale_to_2k": true
+  "upscale_to_2k": false
 }
 ```
 
-The response contains a PNG as base64 plus its dimensions, transparency status, upscaler details, and used seed. When `remove_background` is enabled, `rembg[gpu]` runs through ONNX Runtime's CUDA execution provider and returns a genuine alpha PNG. When `upscale_to_2k` is enabled, the app uses the `caidas/swin2SR-lightweight-x2-64` neural super-resolution model with its portable PIL/NumPy processor, so Torchvision is not required. It preserves any alpha channel separately and enlarges the longest edge to 2048 pixels without downscaling larger images. If Swin2SR cannot load or fit in memory, the response reports that it used the Lanczos fallback. LoRA names resolve to `jjmcarrascosa/<lora_name>`; fully-qualified private model IDs also work.
+The response contains a PNG as base64 plus its dimensions, transparency status, upscaler details, used seed, and a replayable `generation_parameters` object. Reuse those parameter fields in the approved-final request so prompt, LoRA, negative prompt, steps, guidance, LoRA scale, seed, scheduler, and base model remain locked. The draft and final both generate at 1024×1024; only the final sets `upscale_to_2k: true`, producing 2048×2048. When `remove_background` is enabled, `rembg[gpu]` runs through ONNX Runtime's CUDA execution provider and returns a genuine alpha PNG. If Swin2SR cannot load or fit in memory, the response reports that it used the Lanczos fallback. LoRA names resolve to `jjmcarrascosa/<lora_name>`; fully-qualified private model IDs also work.
 
 ## Hardware
 
