@@ -1036,8 +1036,6 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
                         slot_image = gr.Image(
                             interactive=False,
                             height=220,
-                            show_download_button=False,
-                            show_share_button=False,
                         )
                         slot_caption = gr.Textbox(
                             placeholder="Describe this image…",
