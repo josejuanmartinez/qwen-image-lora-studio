@@ -510,6 +510,37 @@ def with_trigger(text: str, trigger_word: str) -> str:
     return f"{trigger_word}, {text}"
 
 
+def load_caption_sidecars(paths) -> dict[str, str]:
+    """Map lowercased file stem -> caption text for uploaded .txt files."""
+    captions: dict[str, str] = {}
+    for path in paths or []:
+        candidate = Path(str(path))
+        if candidate.suffix.lower() != CAPTION_SUFFIX:
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if text:
+            captions[candidate.stem.lower()] = text
+    return captions
+
+
+def apply_sidecars(captions, files, sidecars, overwrite: bool):
+    """Fill caption fields from uploaded .txt files matched by filename stem."""
+    updated = dict(captions or {})
+    sidecars = sidecars or {}
+    matched = 0
+    for item in files or []:
+        text = sidecars.get(Path(item).stem.lower())
+        if not text:
+            continue
+        matched += 1
+        if overwrite or not (updated.get(item) or "").strip():
+            updated[item] = text
+    return updated, matched
+
+
 def caption_progress(captions, files) -> str:
     files = list(files or [])
     captions = captions or {}
@@ -641,16 +672,45 @@ def gallery_page(files, page: int = 1, captions=None):
     )
 
 
-def add_gallery_files(new_files, existing_files, captions):
+def add_gallery_files(new_files, existing_files, captions, sidecars):
     accumulated = list(existing_files or [])
     for path in new_files or []:
         path = str(path)
         if path not in accumulated:
             accumulated.append(path)
+    updated, _ = apply_sidecars(captions, accumulated, sidecars, overwrite=False)
     return (
         accumulated,
-        caption_progress(captions, accumulated),
-        *gallery_page(accumulated, 1, captions),
+        updated,
+        caption_progress(updated, accumulated),
+        *gallery_page(accumulated, 1, updated),
+    )
+
+
+def add_caption_files(new_files, captions, files, sidecars, page):
+    """Load .txt captions named after the images and drop them into the fields."""
+    files = list(files or [])
+    loaded = load_caption_sidecars(new_files)
+    merged = dict(sidecars or {})
+    merged.update(loaded)
+    updated, matched = apply_sidecars(captions, files, loaded, overwrite=True)
+    if not files:
+        note = (
+            f"Loaded {len(loaded)} caption file(s). "
+            "They will fill in automatically as you add the matching images."
+        )
+    else:
+        note = f"Loaded {len(loaded)} caption file(s); {matched} matched an image by name."
+        stems = {Path(item).stem.lower() for item in files}
+        unmatched = sorted(stem for stem in loaded if stem not in stems)
+        if unmatched:
+            shown = ", ".join(unmatched[:5]) + ("…" if len(unmatched) > 5 else "")
+            note += f" No image named: {shown}."
+    return (
+        updated,
+        merged,
+        f"{note} {caption_progress(updated, files)}",
+        *gallery_page(files, page, updated),
     )
 
 
@@ -659,7 +719,7 @@ def change_gallery_page(files, page: int, delta: int, captions):
 
 
 def clear_gallery():
-    return [], {}, caption_progress({}, []), *gallery_page([], 1, {})
+    return [], {}, {}, caption_progress({}, []), *gallery_page([], 1, {})
 
 
 def training_button_state(lora_name: str, trigger_word: str, files):
@@ -1015,6 +1075,7 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
     with gr.Tab("Train"):
         image_files = gr.State([])
         image_captions = gr.State({})
+        caption_sidecars = gr.State({})
         gallery_page_number = gr.State(1)
         with gr.Row():
             upload = gr.UploadButton(
@@ -1024,9 +1085,16 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
                 type="filepath",
                 variant="primary",
             )
+            caption_upload = gr.UploadButton(
+                "Add caption .txt files",
+                file_count="multiple",
+                file_types=[".txt"],
+                type="filepath",
+            )
             clear_images = gr.Button("Clear images")
         caption_status = gr.Markdown(
-            "Add images, then describe each one in the field under its thumbnail."
+            "Add images, then describe each one in the field under its thumbnail. "
+            "You can also upload .txt files named after the images (cammy.txt -> cammy.png)."
         )
         slot_columns, slot_images, slot_captions = [], [], []
         for _row in range(GALLERY_PAGE_SIZE // 4):
@@ -1063,8 +1131,13 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
         ]
         upload.upload(
             add_gallery_files,
-            [upload, image_files, image_captions],
-            [image_files, caption_status, *gallery_outputs],
+            [upload, image_files, image_captions, caption_sidecars],
+            [image_files, image_captions, caption_status, *gallery_outputs],
+        )
+        caption_upload.upload(
+            add_caption_files,
+            [caption_upload, image_captions, image_files, caption_sidecars, gallery_page_number],
+            [image_captions, caption_sidecars, caption_status, *gallery_outputs],
         )
         for slot_index, slot_caption in enumerate(slot_captions):
             slot_caption.change(
@@ -1088,7 +1161,10 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
         )
         clear_images.click(
             clear_gallery,
-            outputs=[image_files, image_captions, caption_status, *gallery_outputs],
+            outputs=[
+                image_files, image_captions, caption_sidecars,
+                caption_status, *gallery_outputs,
+            ],
         )
 
         with gr.Row():
