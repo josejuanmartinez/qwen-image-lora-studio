@@ -187,6 +187,20 @@ If Swin2SR cannot download, initialize, or fit in the available VRAM, generation
 It falls back to a plain Lanczos resize, frees the CUDA cache, and reports the fallback both in
 the result caption and in the API response's `upscale_warning`.
 
+## Project files
+
+| File | Contents |
+| --- | --- |
+| `app.py` | Entrypoint. Mounts `POST /v1/generate` on the Gradio app and launches it. Imports `ui` first so `spaces` (ZeroGPU) initializes before torch. |
+| `ui.py` | Gradio layer: the Train and Generate tabs, their event handlers, and the layout. Builds `demo` at import time. |
+| `style.css` | All custom CSS for the Space, read at import into `APP_CSS`. Keeps presentation out of the layout code. |
+| `generation.py` | Inference: LoRA pipeline loading, the `GenerateRequest` model, rembg cutouts, and tiled Swin2SR upscaling. |
+| `training.py` | Training: job registry, AI Toolkit bootstrap into its isolated venv, dataset and caption handling, upload to a private repo. |
+| `requirements.txt` | Space dependencies. AI Toolkit's own pins live in the separate venv `training.py` creates. |
+| `examples/` | Gallery screenshots used by this README. |
+
+The dependency direction is one-way: `training` <- `generation` <- `ui` <- `app`. Training imports nothing from the other layers.
+
 ## Environment notes
 
 The Space intentionally uses Python 3.11 because AI Toolkit currently pins SciPy 1.12, which does not provide Python 3.13 wheels.

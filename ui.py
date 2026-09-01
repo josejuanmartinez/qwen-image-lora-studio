@@ -47,24 +47,8 @@ from training import (
     with_trigger,
 )
 
-APP_CSS = """
-.training-log-console textarea {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
-    overflow-y: auto !important;
-    resize: none !important;
-}
-.transparent-result .image-container,
-.transparent-result .wrap {
-    background-color: #f4f4f4 !important;
-    background-image:
-        linear-gradient(45deg, #d8d8d8 25%, transparent 25%),
-        linear-gradient(-45deg, #d8d8d8 25%, transparent 25%),
-        linear-gradient(45deg, transparent 75%, #d8d8d8 75%),
-        linear-gradient(-45deg, transparent 75%, #d8d8d8 75%) !important;
-    background-position: 0 0, 0 10px, 10px -10px, -10px 0 !important;
-    background-size: 20px 20px !important;
-}
-"""
+# Presentation is isolated in style.css; this module keeps only layout and behaviour.
+APP_CSS = (Path(__file__).parent / "style.css").read_text(encoding="utf-8")
 
 
 def start_training(files, lora_name: str, trigger_word: str, caption: str, image_caption_map, *param_values):
