@@ -702,7 +702,7 @@ with gr.Blocks(title="Qwen Image LoRA Studio") as demo:
                 info="Strength with which generation follows the text prompt.",
             )
             scale = gr.Slider(
-                0, 2, value=0.8, step=0.05, label="LoRA scale",
+                0, 2, value=1.25, step=0.05, label="LoRA scale",
                 info="Influence of the selected LoRA on the generated image.",
             )
             seed = gr.Number(
